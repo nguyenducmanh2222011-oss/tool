@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         KAGEVIETSUB Mobile Translator
 // @namespace    https://kagevietsub.com/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Tự động dịch file phụ đề SRT Trung - Việt bằng DeepSeek trên trình duyệt điện thoại.
 // @author       KageVietSub
 // @match        https://chat.deepseek.com/*
@@ -19,11 +19,15 @@
     // 1. CẤU HÌNH & HẰNG SỐ
     // =========================================================================
     const CONFIG = {
-        BATCH_SIZE: 60,                // Số câu mỗi đoạn (tối ưu cho di động để tránh tràn bộ nhớ và DOM lag)
+        DEFAULT_BATCH_SIZE: 100,       // Mặc định 100 dòng/lô
         MAX_RETRIES: 3,                // Số lần thử lại tối đa cho mỗi đoạn nếu thiếu câu
         POLL_INTERVAL_MS: 800,         // Chu kỳ kiểm tra phản hồi của AI
         STABLE_CHECKS_REQUIRED: 3,     // Số lần nội dung không đổi liên tiếp để xác nhận AI đã hoàn tất
+        SAFE_FULL_MODE_ITEMS: 300,     // Ngưỡng cảnh báo số lượng subtitle khi gửi toàn bộ
+        SAFE_FULL_MODE_CHARS: 25000,   // Ngưỡng ký tự cảnh báo khi gửi toàn bộ
         STORAGE_KEY: 'kagevietsub_mobile_session',
+        CONFIG_KEY_MODE: 'kg_pref_send_mode',
+        CONFIG_KEY_BATCH: 'kg_pref_batch_size',
         DEFAULT_PROMPT: `Bạn là công cụ dịch phụ đề Trung → Việt.
 
 Dịch toàn bộ nội dung tiếng Trung sang tiếng Việt.
@@ -50,6 +54,12 @@ Dữ liệu cần dịch:`
     // Regex CJK nhận diện chữ Hán
     const CHINESE_REGEX = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
 
+    // Trạng thái cấu hình người dùng
+    let userSettings = {
+        mode: 'lines',           // 'lines' (theo số dòng) | 'all' (toàn bộ SRT)
+        batchSize: 100           // 20, 50, 100, 200, 300, hoặc tùy chỉnh
+    };
+
     // Trạng thái phiên dịch hiện tại
     let currentSession = {
         fileName: '',
@@ -61,7 +71,52 @@ Dữ liệu cần dịch:`
     };
 
     // =========================================================================
-    // 2. CÔNG CỤ XỬ LÝ SRT & KIỂM TRA CHẤT LƯỢNG (PORT TỪ PYTHON)
+    // 2. LƯU VÀ KHÔI PHỤC CẤU HÌNH (TƯƠNG THÍCH TAMPERMONKEY VÀ USERSCRIPTS IOS)
+    // =========================================================================
+
+    function loadUserConfig() {
+        let mode = 'lines';
+        let batchSize = CONFIG.DEFAULT_BATCH_SIZE;
+
+        try {
+            if (typeof GM_getValue === 'function') {
+                mode = GM_getValue(CONFIG.CONFIG_KEY_MODE, mode);
+                batchSize = Number(GM_getValue(CONFIG.CONFIG_KEY_BATCH, batchSize)) || batchSize;
+            } else {
+                mode = localStorage.getItem(CONFIG.CONFIG_KEY_MODE) || mode;
+                batchSize = Number(localStorage.getItem(CONFIG.CONFIG_KEY_BATCH)) || batchSize;
+            }
+        } catch (e) {
+            try {
+                mode = localStorage.getItem(CONFIG.CONFIG_KEY_MODE) || mode;
+                batchSize = Number(localStorage.getItem(CONFIG.CONFIG_KEY_BATCH)) || batchSize;
+            } catch (err) {}
+        }
+
+        userSettings.mode = (mode === 'all' ? 'all' : 'lines');
+        userSettings.batchSize = batchSize > 0 ? batchSize : CONFIG.DEFAULT_BATCH_SIZE;
+    }
+
+    function saveUserConfig(mode, batchSize) {
+        userSettings.mode = mode;
+        userSettings.batchSize = batchSize;
+        try {
+            if (typeof GM_setValue === 'function') {
+                GM_setValue(CONFIG.CONFIG_KEY_MODE, mode);
+                GM_setValue(CONFIG.CONFIG_KEY_BATCH, batchSize);
+            }
+            localStorage.setItem(CONFIG.CONFIG_KEY_MODE, mode);
+            localStorage.setItem(CONFIG.CONFIG_KEY_BATCH, String(batchSize));
+        } catch (e) {
+            try {
+                localStorage.setItem(CONFIG.CONFIG_KEY_MODE, mode);
+                localStorage.setItem(CONFIG.CONFIG_KEY_BATCH, String(batchSize));
+            } catch (err) {}
+        }
+    }
+
+    // =========================================================================
+    // 3. CÔNG CỤ XỬ LÝ SRT & KIỂM TRA CHẤT LƯỢNG (PORT TỪ PYTHON TOOL PC)
     // =========================================================================
 
     function containsChinese(text) {
@@ -200,7 +255,7 @@ Dữ liệu cần dịch:`
     }
 
     // =========================================================================
-    // 3. TƯƠNG TÁC DOM DEEPSEEK TRÊN MOBILE
+    // 4. TƯƠNG TÁC DOM DEEPSEEK TRÊN MOBILE
     // =========================================================================
 
     function sleep(ms) {
@@ -250,8 +305,6 @@ Dữ liệu cần dịch:`
 
     // Tìm nút gửi tin nhắn thực tế của DeepSeek (Không dùng Enter trên mobile!)
     function findSendButton() {
-        // Cấu trúc do người dùng cung cấp và các selector chuẩn hóa:
-        // div[role="button"].ds-button--primary
         const selectors = [
             'div[role="button"][class*="ds-button--primary"]',
             'div[role="button"].ds-button--primary',
@@ -275,7 +328,6 @@ Dữ liệu cần dịch:`
             }
         }
 
-        // Tìm kiếm dự phòng: Nút có SVG icon gửi (arrow/send) trong vùng footer/chat input
         const chatInput = findChatInput();
         if (chatInput) {
             const formContainer = chatInput.closest('form') || chatInput.closest('div[class*="input"]') || chatInput.parentElement?.parentElement;
@@ -290,7 +342,6 @@ Dữ liệu cần dịch:`
         return null;
     }
 
-    // Kích hoạt click an toàn cho cả chuột và cảm ứng trên điện thoại
     function clickButton(btn) {
         if (!btn) return false;
         try {
@@ -306,27 +357,7 @@ Dữ liệu cần dịch:`
         }
     }
 
-    // Kiểm tra AI có đang sinh nội dung hay không (Stop button)
     function isAiGenerating() {
-        const stopSelectors = [
-            'button:has-text("Stop")',
-            'div[role="button"]:has-text("Stop")',
-            'button[aria-label*="Stop"]',
-            'div[role="button"][aria-label*="Stop"]',
-            'div[role="button"][class*="ds-button"]:has(svg rect)', // SVG stop icon
-            'div[class*="ds-button"]:has(rect)'
-        ];
-
-        for (const sel of stopSelectors) {
-            try {
-                const el = document.querySelector(sel);
-                if (el && el.offsetParent !== null) return true;
-            } catch (e) {
-                // Selector :has-text có thể không hỗ trợ trong native querySelector
-            }
-        }
-
-        // Kiểm tra qua text content các nút
         const allButtons = document.querySelectorAll('div[role="button"], button');
         for (const b of allButtons) {
             const t = (b.innerText || '').trim().toLowerCase();
@@ -334,11 +365,9 @@ Dữ liệu cần dịch:`
                 if (b.offsetParent !== null) return true;
             }
         }
-
         return false;
     }
 
-    // Kiểm tra AI có đang suy nghĩ không (DeepThink)
     function isAiThinking() {
         const thinkingEls = document.querySelectorAll('[class*="thinking"], div.thinking-process, div[class*="reasoning"]');
         for (const el of thinkingEls) {
@@ -349,7 +378,6 @@ Dữ liệu cần dịch:`
         return false;
     }
 
-    // Tìm và bấm nút "Tiếp tục" nếu AI bị ngắt giữa chừng
     function checkAndClickContinue() {
         const allButtons = document.querySelectorAll('button, div[role="button"]');
         for (const btn of allButtons) {
@@ -365,7 +393,6 @@ Dữ liệu cần dịch:`
         return false;
     }
 
-    // Lấy nội dung phản hồi mới nhất của trợ lý DeepSeek
     function getLatestAssistantText() {
         const selectors = [
             '.ds-markdown.ds-assistant-message-main-content',
@@ -379,7 +406,6 @@ Dữ liệu cần dịch:`
             const list = document.querySelectorAll(sel);
             if (list.length > 0) {
                 const last = list[list.length - 1];
-                // Ưu tiên khối code nếu có
                 const pre = last.querySelector('pre');
                 if (pre && pre.innerText.includes('#')) {
                     return pre.innerText;
@@ -390,15 +416,12 @@ Dữ liệu cần dịch:`
         return '';
     }
 
-    // Đếm số lượng tin nhắn trợ lý hiện tại
     function getAssistantMessageCount() {
         const list = document.querySelectorAll('.ds-markdown.ds-assistant-message-main-content, .ds-assistant-message-main-content');
         return list.length;
     }
 
-    // Tạo chat mới (để cô lập context giữa các batch hoặc khi gặp Length Limit)
     async function createNewChat() {
-        // Tìm nút New Chat qua biểu tượng hoặc text
         const buttons = document.querySelectorAll('div[role="button"], button, a[href="/"]');
         for (const btn of buttons) {
             if (btn.offsetParent !== null) {
@@ -409,7 +432,6 @@ Dữ liệu cần dịch:`
                     await sleep(1500);
                     return true;
                 }
-                // Kiểm tra SVG plus icon
                 const svg = btn.querySelector('svg');
                 if (svg && svg.getAttribute('viewBox') === '0 0 16 16') {
                     clickButton(btn);
@@ -419,7 +441,6 @@ Dữ liệu cần dịch:`
             }
         }
 
-        // Fallback: Điều hướng về trang chủ DeepSeek chat nếu không click được nút
         try {
             const homeLink = document.querySelector('a[href="/"]');
             if (homeLink) {
@@ -434,21 +455,18 @@ Dữ liệu cần dịch:`
     }
 
     // =========================================================================
-    // 4. TIẾN TRÌNH DỊCH & THEO DÕI PHẢN HỒI
+    // 5. TIẾN TRÌNH DỊCH & THEO DÕI PHẢN HỒI
     // =========================================================================
 
-    // Gửi tin nhắn và kiểm tra
     async function sendMessageAndWaitConfirmation(textToSend, maxWaitMs = 8000) {
         const input = findChatInput();
         if (!input) {
             throw new Error('Không tìm thấy khung nhập tin nhắn của DeepSeek.');
         }
 
-        // Nhập nội dung
         setInputValue(input, textToSend);
         await sleep(500);
 
-        // Chờ nút gửi sáng và bấm
         let sendBtn = null;
         const startFind = Date.now();
         while (Date.now() - startFind < 4000) {
@@ -462,11 +480,8 @@ Dữ liệu cần dịch:`
         }
 
         const baselineCount = getAssistantMessageCount();
-
-        // Bấm nút gửi thực tế
         clickButton(sendBtn);
 
-        // Xác nhận gửi thành công (input được xóa hoặc xuất hiện phản hồi)
         const startConfirm = Date.now();
         while (Date.now() - startConfirm < maxWaitMs) {
             if (currentSession.stopRequested) return false;
@@ -485,7 +500,6 @@ Dữ liệu cần dịch:`
         return false;
     }
 
-    // Theo dõi AI sinh phản hồi cho đến khi hoàn thành
     async function monitorAiResponse(onProgressText, timeoutSec = 300) {
         const startTime = Date.now();
         let lastText = '';
@@ -496,7 +510,6 @@ Dữ liệu cần dịch:`
                 return lastText;
             }
 
-            // Kiểm tra nút Tiếp tục
             if (checkAndClickContinue()) {
                 stableCount = 0;
                 await sleep(1000);
@@ -507,7 +520,6 @@ Dữ liệu cần dịch:`
             const isThk = isAiThinking();
             const currentText = getLatestAssistantText();
 
-            // Kiểm tra lỗi giới hạn độ dài
             if (currentText.includes('Length limit reached') || currentText.includes('đã đạt giới hạn độ dài')) {
                 throw new Error('DEEPSEEK_LENGTH_LIMIT');
             }
@@ -519,7 +531,6 @@ Dữ liệu cần dịch:`
             } else if (!isGen && !isThk && lastText.length > 0) {
                 stableCount++;
                 if (stableCount >= CONFIG.STABLE_CHECKS_REQUIRED) {
-                    // Phản hồi đã hoàn tất ổn định!
                     return lastText;
                 }
             }
@@ -530,7 +541,6 @@ Dữ liệu cần dịch:`
         return lastText;
     }
 
-    // Xử lý dịch 1 batch và retry nếu thiếu dòng
     async function processBatchWithRetries(batchItems, batchIdx, totalBatches) {
         const expectedIds = batchItems.map(it => it.id);
         const expectedSet = new Set(expectedIds);
@@ -538,7 +548,6 @@ Dữ liệu cần dịch:`
 
         updateUIStatus(`Đang dịch đoạn ${batchIdx}/${totalBatches}...`);
 
-        // Xây dựng prompt đợt 1
         const dataLines = batchItems.map(it => `#${it.id} ${it.original}`).join('\n');
         const initialPrompt = `${CONFIG.DEFAULT_PROMPT}\n\n${dataLines}`;
 
@@ -550,21 +559,17 @@ Dữ liệu cần dịch:`
         updateUIStatus(`Đang chờ DeepSeek trả lời đoạn ${batchIdx}/${totalBatches}...`);
 
         let responseText = await monitorAiResponse((text) => {
-            // Streaming parse cập nhật tiến độ tức thì
             const partial = parseAiResponse(text, expectedSet);
-            let validInBatch = 0;
             for (const [id, trans] of Object.entries(partial)) {
                 const it = itemMap.get(Number(id));
                 if (it && isTranslationValid(it.original, trans).valid) {
                     it.translated = trans;
                     it.status = 'translated';
-                    validInBatch++;
                 }
             }
             updateSessionProgress();
         });
 
-        // Phân tích kết quả cuối cùng
         let parsedResults = parseAiResponse(responseText, expectedSet);
         for (const [idStr, trans] of Object.entries(parsedResults)) {
             const id = Number(idStr);
@@ -578,18 +583,17 @@ Dữ liệu cần dịch:`
             }
         }
 
-        // Vòng lặp RETRY nếu thiếu câu (tối đa CONFIG.MAX_RETRIES)
+        // Retry nếu thiếu dòng
         let retryAttempt = 1;
         while (retryAttempt <= CONFIG.MAX_RETRIES && !currentSession.stopRequested) {
             const missingItems = batchItems.filter(it => !it.translated || it.status !== 'translated');
             if (missingItems.length === 0) {
-                break; // Đã đủ 100%!
+                break;
             }
 
             updateUIStatus(`Thiếu ${missingItems.length} câu. Đang xử lý lại (lần ${retryAttempt}/${CONFIG.MAX_RETRIES})...`);
             await sleep(1500);
 
-            // Xây dựng thông điệp retry chuyên biệt
             const missingLines = missingItems.map(it => `#${it.id} ${it.original}`).join('\n');
             const retryMessage = `Dưới đây là các câu còn thiếu hoặc cần dịch lại từ lượt trước. Hãy dịch chuẩn xác sang tiếng Việt theo đúng ngữ cảnh đã dịch.
 
@@ -626,30 +630,47 @@ ${missingLines}`;
             retryAttempt++;
         }
 
-        // Kiểm tra lần cuối
         const stillMissing = batchItems.filter(it => !it.translated || it.status !== 'translated');
         if (stillMissing.length > 0) {
             throw new Error(`Đoạn ${batchIdx} còn thiếu ${stillMissing.length} câu sau ${CONFIG.MAX_RETRIES} lần thử lại.`);
         }
 
-        // Lưu trạng thái tiến trình
         saveSessionToStorage();
         return true;
     }
 
-    // Tiến trình dịch toàn bộ file
     async function startTranslationProcess() {
         if (!currentSession.items || currentSession.items.length === 0) {
             alert('Vui lòng chọn file phụ đề SRT trước.');
             return;
         }
 
+        // 1. Kiểm tra cấu hình và cảnh báo nếu chọn Gửi toàn bộ
+        const totalItems = currentSession.items.length;
+        const mode = userSettings.mode;
+        let batchSize = userSettings.batchSize;
+
+        if (mode === 'all') {
+            batchSize = totalItems;
+            const totalChars = currentSession.items.reduce((sum, it) => sum + it.original.length, 0);
+
+            if (totalItems > CONFIG.SAFE_FULL_MODE_ITEMS || totalChars > CONFIG.SAFE_FULL_MODE_CHARS) {
+                const confirmMsg = `CẢNH BÁO: File có ${totalItems.toLocaleString('vi-VN')} dòng phụ đề (~${totalChars.toLocaleString('vi-VN')} ký tự).\n\n` +
+                    `Gửi toàn bộ trong 1 lần vượt ngưỡng tối ưu của DeepSeek, dễ dẫn đến bị ngắt câu hoặc lỗi giới hạn độ dài.\n\n` +
+                    `Bạn có muốn tiếp tục gửi toàn bộ không?\n` +
+                    `• Nhấn [OK] để tiếp tục gửi toàn bộ.\n` +
+                    `• Nhấn [Cancel] để quay lại và chọn 'Gửi theo số dòng' (khuyên dùng 50-100 dòng/lần).`;
+                if (!confirm(confirmMsg)) {
+                    updateUIStatus('Đã hủy gửi toàn bộ. Vui lòng chọn chế độ chia đoạn.');
+                    return;
+                }
+            }
+        }
+
         currentSession.isTranslating = true;
         currentSession.stopRequested = false;
         updateUIState(true);
 
-        const totalItems = currentSession.items.length;
-        const batchSize = CONFIG.BATCH_SIZE;
         const totalBatches = Math.ceil(totalItems / batchSize);
         currentSession.totalBatches = totalBatches;
 
@@ -657,7 +678,7 @@ ${missingLines}`;
             updateUIStatus('Đang kiểm tra giao diện DeepSeek...');
             const input = findChatInput();
             if (!input) {
-                throw new Error('Không tìm thấy khung nhập tin nhắn của DeepSeek. Vui lòng mở trang chat và đăng nhập.');
+                throw new Error('Không tìm thấy khung nhập tin nhắn của DeepSeek. Vui lòng kiểm tra đã đăng nhập chưa.');
             }
 
             for (let b = currentSession.currentBatchIndex; b < totalBatches; b++) {
@@ -671,10 +692,8 @@ ${missingLines}`;
                 const endIdx = Math.min(startIdx + batchSize, totalItems);
                 const batchItems = currentSession.items.slice(startIdx, endIdx);
 
-                // Dịch batch hiện tại
                 await processBatchWithRetries(batchItems, b + 1, totalBatches);
 
-                // Sau mỗi batch hoàn thành, nếu còn batch tiếp theo -> tạo New Chat để giải phóng context
                 if (b + 1 < totalBatches && !currentSession.stopRequested) {
                     updateUIStatus(`Đang tạo cuộc trò chuyện mới cho đoạn ${b + 2}/${totalBatches}...`);
                     await createNewChat();
@@ -682,13 +701,12 @@ ${missingLines}`;
                 }
             }
 
-            // Kiểm tra xem đã hoàn thành 100% chưa
             const missingTotal = currentSession.items.filter(it => !it.translated || it.status !== 'translated');
             if (missingTotal.length === 0 && !currentSession.stopRequested) {
                 updateUIStatus('Đang tạo file phụ đề hoàn chỉnh...');
                 await sleep(500);
                 downloadTranslatedSrt();
-                updateUIStatus('Hoàn thành! Đã tải file SRT.');
+                updateUIStatus('Hoàn thành! Đã tự động tải file SRT.');
                 clearSessionStorage();
             } else if (!currentSession.stopRequested) {
                 updateUIStatus(`Dịch chưa xong: Còn thiếu ${missingTotal.length} câu.`);
@@ -697,15 +715,20 @@ ${missingLines}`;
         } catch (error) {
             console.error('[KageVietSub Error]', error);
             if (error.message === 'DEEPSEEK_LENGTH_LIMIT') {
-                updateUIStatus('DeepSeek đạt giới hạn độ dài! Đang mở chat mới và thử lại...');
-                await createNewChat();
-                await sleep(2000);
-                // Thử chạy tiếp
-                setTimeout(startTranslationProcess, 1000);
-                return;
+                if (mode === 'all') {
+                    alert('DeepSeek đã đạt giới hạn độ dài hội thoại trong chế độ Gửi toàn bộ!\n\nKhuyên dùng: Hãy chuyển sang "Gửi theo số dòng" (50 hoặc 100 dòng/lần) để dịch từng đoạn an toàn.');
+                    updateUIStatus('Gặp lỗi giới hạn độ dài. Hãy chuyển sang "Gửi theo số dòng".');
+                } else {
+                    updateUIStatus('DeepSeek đạt giới hạn độ dài! Đang mở chat mới và thử lại...');
+                    await createNewChat();
+                    await sleep(2000);
+                    setTimeout(startTranslationProcess, 1000);
+                    return;
+                }
+            } else {
+                updateUIStatus(`Lỗi: ${error.message || error}`);
+                alert(`Lỗi trong quá trình dịch: ${error.message || error}`);
             }
-            updateUIStatus(`Lỗi: ${error.message || error}`);
-            alert(`Lỗi trong quá trình dịch: ${error.message || error}`);
         } finally {
             currentSession.isTranslating = false;
             updateUIState(false);
@@ -713,7 +736,7 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 5. TẠO VÀ TỰ ĐỘNG TẢI FILE SRT HOÀN CHỈNH
+    // 6. TẠO VÀ TỰ ĐỘNG TẢI FILE SRT HOÀN CHỈNH
     // =========================================================================
 
     function buildCompleteSrtContent() {
@@ -732,7 +755,6 @@ ${missingLines}`;
         if (baseName.toLowerCase().endsWith('.srt')) {
             baseName = baseName.substring(0, baseName.length - 4);
         }
-        // Loại bỏ hậu tố _dich nếu đã có
         baseName = baseName.replace(/_dich(_\d+)?$/i, '');
         const outputName = `${baseName}_dich.srt`;
 
@@ -750,7 +772,7 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 6. LƯU VÀ KHÔI PHỤC TIẾN TRÌNH (STORAGE)
+    // 7. LƯU VÀ KHÔI PHỤC TIẾN TRÌNH (SESSION STORAGE)
     // =========================================================================
 
     function saveSessionToStorage() {
@@ -787,7 +809,7 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 7. GIAO DIỆN NGƯỜI DÙNG MOBILE (HTML + CSS)
+    // 8. GIAO DIỆN NGƯỜI DÙNG MOBILE (HTML + CSS) - CẬP NHẬT MỤC 16
     // =========================================================================
 
     let uiElements = {
@@ -795,10 +817,16 @@ ${missingLines}`;
         header: null,
         fileInput: null,
         selectFileBtn: null,
+        fileNameLabel: null,
+        totalCountLabel: null,
+        modeSelect: null,
+        batchSizeContainer: null,
+        batchSelect: null,
+        batchCustomInput: null,
+        startBtn: null,
         progressLabel: null,
         progressBar: null,
         statusLabel: null,
-        controlBtn: null,
         collapseBtn: null,
         contentBody: null
     };
@@ -806,7 +834,8 @@ ${missingLines}`;
     function injectUI() {
         if (document.getElementById('kagevietsub-mobile-widget')) return;
 
-        // Container chính
+        loadUserConfig();
+
         const container = document.createElement('div');
         container.id = 'kagevietsub-mobile-widget';
         container.style.cssText = `
@@ -819,7 +848,7 @@ ${missingLines}`;
             color: #e6e6e6;
             border: 1px solid #333544;
             border-radius: 12px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
             z-index: 999999;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             font-size: 13px;
@@ -851,26 +880,118 @@ ${missingLines}`;
                     justify-content: center;
                 ">−</span>
             </div>
-            <div id="kg-body" style="padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;">
+            <div id="kg-body" style="padding: 12px 14px; display: flex; flex-direction: column; gap: 9px;">
                 <input type="file" id="kg-file-input" accept=".srt" style="display: none;" />
                 <button id="kg-select-file-btn" style="
+                    background: #282a36;
+                    color: #cfd3dc;
+                    border: 1px dashed #4e8cff;
+                    border-radius: 8px;
+                    padding: 10px 14px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    width: 100%;
+                    min-height: 42px;
+                    box-sizing: border-box;
+                    text-align: center;
+                    touch-action: manipulation;
+                ">[ Chọn file SRT ]</button>
+
+                <div id="kg-file-meta" style="
+                    display: flex;
+                    flex-direction: column;
+                    gap: 3px;
+                    background: #20222c;
+                    padding: 8px 10px;
+                    border-radius: 6px;
+                    border: 1px solid #2b2e3b;
+                ">
+                    <div id="kg-filename-label" style="font-size: 12px; color: #9ea3b5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                        Tên file: <span style="color: #ffffff; font-weight: 500;">(Chưa chọn)</span>
+                    </div>
+                    <div id="kg-total-count-label" style="font-size: 12px; color: #9ea3b5;">
+                        Tổng phụ đề: <span style="color: #ffffff; font-weight: 500;">0 dòng</span>
+                    </div>
+                </div>
+
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <label style="font-size: 12px; color: #8c90a4; font-weight: 600;">Chế độ gửi:</label>
+                    <select id="kg-mode-select" style="
+                        background: #20222c;
+                        color: #ffffff;
+                        border: 1px solid #3a3d4d;
+                        border-radius: 6px;
+                        padding: 8px 10px;
+                        font-size: 13px;
+                        cursor: pointer;
+                        outline: none;
+                        min-height: 38px;
+                    ">
+                        <option value="lines">Gửi theo số dòng ▼</option>
+                        <option value="all">Gửi toàn bộ SRT</option>
+                    </select>
+                </div>
+
+                <div id="kg-batch-container" style="display: flex; flex-direction: column; gap: 4px;">
+                    <label style="font-size: 12px; color: #8c90a4; font-weight: 600;">Số dòng mỗi lần:</label>
+                    <div style="display: flex; gap: 6px;">
+                        <select id="kg-batch-select" style="
+                            flex: 1;
+                            background: #20222c;
+                            color: #ffffff;
+                            border: 1px solid #3a3d4d;
+                            border-radius: 6px;
+                            padding: 8px 10px;
+                            font-size: 13px;
+                            cursor: pointer;
+                            outline: none;
+                            min-height: 38px;
+                        ">
+                            <option value="20">20 dòng</option>
+                            <option value="50">50 dòng</option>
+                            <option value="100">100 dòng</option>
+                            <option value="200">200 dòng</option>
+                            <option value="300">300 dòng</option>
+                            <option value="custom">Tùy chỉnh số dòng...</option>
+                        </select>
+                        <input type="number" id="kg-batch-custom-input" min="5" max="1000" placeholder="Số dòng" style="
+                            display: none;
+                            width: 85px;
+                            background: #20222c;
+                            color: #ffffff;
+                            border: 1px solid #4e8cff;
+                            border-radius: 6px;
+                            padding: 6px 8px;
+                            font-size: 13px;
+                            outline: none;
+                            box-sizing: border-box;
+                        " />
+                    </div>
+                </div>
+
+                <button id="kg-start-btn" disabled style="
                     background: #4e8cff;
                     color: #ffffff;
                     border: none;
                     border-radius: 8px;
                     padding: 12px 14px;
                     font-size: 14px;
-                    font-weight: 600;
+                    font-weight: 700;
                     cursor: pointer;
                     width: 100%;
                     min-height: 44px;
                     box-sizing: border-box;
                     text-align: center;
                     touch-action: manipulation;
-                ">[ Chọn file SRT ]</button>
+                    opacity: 0.5;
+                    transition: all 0.2s ease;
+                ">[ BẮT ĐẦU DỊCH ]</button>
+
+                <div style="border-top: 1px dashed #333544; margin: 2px 0;"></div>
 
                 <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span id="kg-progress-label" style="font-weight: 600; color: #cfd3dc;">Đang dịch: 0%</span>
+                    <span id="kg-progress-label" style="font-weight: 600; color: #cfd3dc; font-size: 12px;">Tiến trình: 0%</span>
                     <span id="kg-count-label" style="color: #8c90a4; font-size: 11px;">0/0 câu</span>
                 </div>
 
@@ -896,7 +1017,7 @@ ${missingLines}`;
                     white-space: nowrap;
                     overflow: hidden;
                     text-overflow: ellipsis;
-                ">Sẵn sàng dịch</div>
+                ">Đang chờ bắt đầu...</div>
 
                 <div id="kg-resume-banner" style="
                     display: none;
@@ -945,6 +1066,13 @@ ${missingLines}`;
         uiElements.header = container.querySelector('#kg-header');
         uiElements.fileInput = container.querySelector('#kg-file-input');
         uiElements.selectFileBtn = container.querySelector('#kg-select-file-btn');
+        uiElements.fileNameLabel = container.querySelector('#kg-filename-label');
+        uiElements.totalCountLabel = container.querySelector('#kg-total-count-label');
+        uiElements.modeSelect = container.querySelector('#kg-mode-select');
+        uiElements.batchSizeContainer = container.querySelector('#kg-batch-container');
+        uiElements.batchSelect = container.querySelector('#kg-batch-select');
+        uiElements.batchCustomInput = container.querySelector('#kg-batch-custom-input');
+        uiElements.startBtn = container.querySelector('#kg-start-btn');
         uiElements.progressLabel = container.querySelector('#kg-progress-label');
         uiElements.progressBar = container.querySelector('#kg-progress-bar');
         uiElements.statusLabel = container.querySelector('#kg-status-label');
@@ -952,12 +1080,47 @@ ${missingLines}`;
         uiElements.contentBody = container.querySelector('#kg-body');
         uiElements.countLabel = container.querySelector('#kg-count-label');
 
+        // Khôi phục cấu hình trên UI
+        syncConfigToUI();
+
+        // Sự kiện đổi chế độ gửi
+        uiElements.modeSelect.addEventListener('change', () => {
+            const val = uiElements.modeSelect.value;
+            userSettings.mode = val;
+            if (val === 'all') {
+                uiElements.batchSizeContainer.style.display = 'none';
+            } else {
+                uiElements.batchSizeContainer.style.display = 'flex';
+            }
+            saveUserConfig(userSettings.mode, userSettings.batchSize);
+        });
+
+        // Sự kiện đổi số dòng mỗi lần
+        uiElements.batchSelect.addEventListener('change', () => {
+            const val = uiElements.batchSelect.value;
+            if (val === 'custom') {
+                uiElements.batchCustomInput.style.display = 'block';
+                uiElements.batchCustomInput.value = userSettings.batchSize || 100;
+                uiElements.batchCustomInput.focus();
+            } else {
+                uiElements.batchCustomInput.style.display = 'none';
+                userSettings.batchSize = Number(val);
+                saveUserConfig(userSettings.mode, userSettings.batchSize);
+            }
+        });
+
+        uiElements.batchCustomInput.addEventListener('input', () => {
+            const val = parseInt(uiElements.batchCustomInput.value, 10);
+            if (val && val > 0) {
+                userSettings.batchSize = val;
+                saveUserConfig(userSettings.mode, userSettings.batchSize);
+            }
+        });
+
         // Sự kiện chọn file
         uiElements.selectFileBtn.addEventListener('click', () => {
             if (currentSession.isTranslating) {
-                if (confirm('Bạn có muốn dừng tiến trình dịch hiện tại không?')) {
-                    currentSession.stopRequested = true;
-                }
+                alert('Tiến trình dịch đang chạy. Hãy nhấn [ DỪNG DỊCH ] trước khi chọn file khác.');
                 return;
             }
             uiElements.fileInput.click();
@@ -983,13 +1146,19 @@ ${missingLines}`;
                     currentSession.fileName = file.name;
                     currentSession.items = items;
                     currentSession.currentBatchIndex = 0;
-                    currentSession.totalBatches = Math.ceil(items.length / CONFIG.BATCH_SIZE);
+
+                    // Cập nhật thông tin file và số dòng lên giao diện
+                    uiElements.fileNameLabel.innerHTML = `Tên file: <span style="color: #ffffff; font-weight: 600;">${file.name}</span>`;
+                    uiElements.totalCountLabel.innerHTML = `Tổng phụ đề: <span style="color: #ffffff; font-weight: 600;">${items.length.toLocaleString('vi-VN')} dòng</span>`;
+
+                    // Kích hoạt nút BẮT ĐẦU DỊCH (KHÔNG tự động dịch ngay!)
+                    uiElements.startBtn.disabled = false;
+                    uiElements.startBtn.style.opacity = '1';
+                    uiElements.startBtn.innerText = '[ BẮT ĐẦU DỊCH ]';
+                    uiElements.startBtn.style.background = '#4e8cff';
 
                     updateSessionProgress();
-                    updateUIStatus(`Đã nạp ${items.length} câu. Bắt đầu dịch tự động...`);
-
-                    // Tự động bắt đầu quá trình dịch
-                    setTimeout(startTranslationProcess, 800);
+                    updateUIStatus('Đã đọc file xong. Hãy xác nhận chế độ và nhấn [ BẮT ĐẦU DỊCH ].');
                 } catch (err) {
                     alert('Lỗi khi đọc file SRT: ' + err);
                     updateUIStatus('Lỗi đọc file.');
@@ -997,6 +1166,25 @@ ${missingLines}`;
             };
 
             reader.readAsText(file, 'utf-8');
+        });
+
+        // Sự kiện nút BẮT ĐẦU DỊCH / DỪNG DỊCH
+        uiElements.startBtn.addEventListener('click', () => {
+            if (currentSession.isTranslating) {
+                if (confirm('Bạn có chắc muốn dừng tiến trình dịch hiện tại không? Dữ liệu đã dịch vẫn được giữ nguyên.')) {
+                    currentSession.stopRequested = true;
+                    updateUIStatus('Đang gửi lệnh dừng...');
+                }
+                return;
+            }
+
+            if (!currentSession.items || currentSession.items.length === 0) {
+                alert('Vui lòng chọn file SRT trước.');
+                return;
+            }
+
+            // Bắt đầu dịch
+            startTranslationProcess();
         });
 
         // Thu gọn / mở rộng giao diện
@@ -1014,8 +1202,28 @@ ${missingLines}`;
             }
         });
 
-        // Kiểm tra phiên cũ để khôi phục
         checkSavedSession();
+    }
+
+    function syncConfigToUI() {
+        if (!uiElements.modeSelect) return;
+        uiElements.modeSelect.value = userSettings.mode;
+        if (userSettings.mode === 'all') {
+            uiElements.batchSizeContainer.style.display = 'none';
+        } else {
+            uiElements.batchSizeContainer.style.display = 'flex';
+        }
+
+        const bSize = userSettings.batchSize;
+        const validPresets = ['20', '50', '100', '200', '300'];
+        if (validPresets.includes(String(bSize))) {
+            uiElements.batchSelect.value = String(bSize);
+            uiElements.batchCustomInput.style.display = 'none';
+        } else {
+            uiElements.batchSelect.value = 'custom';
+            uiElements.batchCustomInput.style.display = 'block';
+            uiElements.batchCustomInput.value = bSize;
+        }
     }
 
     function updateUIStatus(text) {
@@ -1032,7 +1240,7 @@ ${missingLines}`;
         const percent = Math.min(100, Math.round((translatedCount / total) * 100));
 
         if (uiElements.progressLabel) {
-            uiElements.progressLabel.innerText = `Đang dịch: ${percent}%`;
+            uiElements.progressLabel.innerText = `Tiến trình: ${percent}%`;
         }
         if (uiElements.countLabel) {
             uiElements.countLabel.innerText = `${translatedCount}/${total} câu`;
@@ -1043,13 +1251,23 @@ ${missingLines}`;
     }
 
     function updateUIState(isTranslating) {
-        if (!uiElements.selectFileBtn) return;
+        if (!uiElements.startBtn) return;
         if (isTranslating) {
-            uiElements.selectFileBtn.innerText = 'Dừng dịch';
-            uiElements.selectFileBtn.style.background = '#d32f2f';
+            uiElements.startBtn.innerText = '[ DỪNG DỊCH ]';
+            uiElements.startBtn.style.background = '#d32f2f';
+            uiElements.selectFileBtn.style.pointerEvents = 'none';
+            uiElements.selectFileBtn.style.opacity = '0.5';
+            uiElements.modeSelect.disabled = true;
+            uiElements.batchSelect.disabled = true;
+            if (uiElements.batchCustomInput) uiElements.batchCustomInput.disabled = true;
         } else {
-            uiElements.selectFileBtn.innerText = '[ Chọn file SRT ]';
-            uiElements.selectFileBtn.style.background = '#4e8cff';
+            uiElements.startBtn.innerText = '[ BẮT ĐẦU DỊCH ]';
+            uiElements.startBtn.style.background = '#4e8cff';
+            uiElements.selectFileBtn.style.pointerEvents = 'auto';
+            uiElements.selectFileBtn.style.opacity = '1';
+            uiElements.modeSelect.disabled = false;
+            uiElements.batchSelect.disabled = false;
+            if (uiElements.batchCustomInput) uiElements.batchCustomInput.disabled = false;
         }
     }
 
@@ -1071,12 +1289,24 @@ ${missingLines}`;
                             isTranslating: false,
                             stopRequested: false,
                             currentBatchIndex: saved.currentBatchIndex || 0,
-                            totalBatches: saved.totalBatches || Math.ceil(saved.items.length / CONFIG.BATCH_SIZE)
+                            totalBatches: saved.totalBatches || Math.ceil(saved.items.length / (userSettings.batchSize || 100))
                         };
                         banner.style.display = 'none';
+
+                        // Hiển thị tên file và tổng phụ đề
+                        if (uiElements.fileNameLabel) {
+                            uiElements.fileNameLabel.innerHTML = `Tên file: <span style="color: #ffffff; font-weight: 600;">${saved.fileName}</span>`;
+                        }
+                        if (uiElements.totalCountLabel) {
+                            uiElements.totalCountLabel.innerHTML = `Tổng phụ đề: <span style="color: #ffffff; font-weight: 600;">${saved.items.length.toLocaleString('vi-VN')} dòng</span>`;
+                        }
+                        if (uiElements.startBtn) {
+                            uiElements.startBtn.disabled = false;
+                            uiElements.startBtn.style.opacity = '1';
+                        }
+
                         updateSessionProgress();
-                        updateUIStatus(`Đã khôi phục ${translatedCount}/${saved.items.length} câu. Bắt đầu tiếp...`);
-                        setTimeout(startTranslationProcess, 800);
+                        updateUIStatus(`Đã khôi phục ${translatedCount}/${saved.items.length} câu. Nhấn [ BẮT ĐẦU DỊCH ] để tiếp tục.`);
                     };
 
                     discardBtn.onclick = () => {
@@ -1090,13 +1320,12 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 8. KHỞI CHẠY TỰ ĐỘNG
+    // 9. KHỞI CHẠY TỰ ĐỘNG
     // =========================================================================
     window.addEventListener('load', () => {
         setTimeout(injectUI, 1200);
     });
 
-    // Chạy ngay nếu trang đã sẵn sàng
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         setTimeout(injectUI, 1000);
     }
