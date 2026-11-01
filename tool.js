@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         KAGEVIETSUB Mobile Translator
 // @namespace    https://kagevietsub.com/
-// @version      1.1.0
-// @description  Tự động dịch file phụ đề SRT Trung - Việt bằng DeepSeek trên trình duyệt điện thoại.
+// @version      1.2.0
+// @description  Tự động dịch file phụ đề SRT Trung - Việt bằng DeepSeek trên PC và trình duyệt điện thoại (Tự động nhận diện thiết bị).
 // @author       KageVietSub
 // @match        https://chat.deepseek.com/*
 // @grant        GM_setValue
@@ -16,7 +16,7 @@
     'use strict';
 
     // =========================================================================
-    // 1. CẤU HÌNH & HẰNG SỐ
+    // 1. CẤU HÌNH & HẰNG SỐ CHUẨN GỐC (TỪ CONFIG.PY)
     // =========================================================================
     const CONFIG = {
         DEFAULT_BATCH_SIZE: 100,       // Mặc định 100 dòng/lô
@@ -28,6 +28,7 @@
         STORAGE_KEY: 'kagevietsub_mobile_session',
         CONFIG_KEY_MODE: 'kg_pref_send_mode',
         CONFIG_KEY_BATCH: 'kg_pref_batch_size',
+        // PROMPT CHUẨN GỐC TỪ DỰ ÁN KAGEVIETSUB TOOL (CONFIG.PY)
         DEFAULT_PROMPT: `Bạn là công cụ dịch phụ đề Trung → Việt.
 
 Dịch toàn bộ nội dung tiếng Trung sang tiếng Việt.
@@ -54,29 +55,80 @@ Dữ liệu cần dịch:`
     // Regex CJK nhận diện chữ Hán
     const CHINESE_REGEX = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
 
-    // Trạng thái cấu hình người dùng
+    // Trạng thái cấu hình người dùng (Nhóm A: Được lưu lâu dài)
     let userSettings = {
         mode: 'lines',           // 'lines' (theo số dòng) | 'all' (toàn bộ SRT)
         batchSize: 100           // 20, 50, 100, 200, 300, hoặc tùy chỉnh
     };
 
-    // Trạng thái phiên dịch hiện tại
+    // Trạng thái phiên làm việc hiện tại (Nhóm B: Chỉ tồn tại trong RAM/phiên, KHÔNG lưu lâu dài)
     let currentSession = {
         fileName: '',
-        items: [],          // [{ id, timeline, original, translated, status }]
+        items: [],               // [{ id, timeline, original, translated, status }]
         isTranslating: false,
         stopRequested: false,
         currentBatchIndex: 0,
-        totalBatches: 0
+        totalBatches: 0,
+        lastCompletedItem: null, // Lưu câu đã dịch gần nhất để làm ngữ cảnh khi phục hồi length limit
+        detectedEnvironment: null
     };
 
     // =========================================================================
-    // 2. BỘ ĐỆM LƯU TRỮ ĐA MÔI TRƯỜNG (STORAGE ADAPTER)
-    // Tương thích đồng thời: Tampermonkey, Violentmonkey, Stay & Userscripts trên iOS Safari
+    // 2. NHẬN DIỆN MÔI TRƯỜNG THIẾT BỊ (MỤC 18 - DEVICE COMPATIBILITY MANAGER)
+    // =========================================================================
+    const DeviceCompatibilityManager = {
+        MODE_DESKTOP: 'DESKTOP',
+        MODE_MOBILE: 'MOBILE',
+        currentMode: null,
+
+        detect() {
+            const ua = (navigator.userAgent || '').toLowerCase();
+            const platform = (navigator.platform || '').toLowerCase();
+
+            // 1. Kiểm tra khả năng cảm ứng (Touch capability)
+            const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || (navigator.msMaxTouchPoints > 0);
+
+            // 2. Kiểm tra kiểu con trỏ (Coarse = ngón tay trên màn cảm ứng, Fine = chuột máy tính)
+            let isCoarse = false;
+            try {
+                isCoarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+            } catch (e) {}
+
+            // 3. Kiểm tra kiểu thiết bị và nền tảng
+            const isMobileUa = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini|mobile/i.test(ua);
+            const isIpadOs = platform.includes('mac') && hasTouch && navigator.maxTouchPoints > 1;
+            const isSmallScreen = window.innerWidth <= 768 || window.screen.width <= 768;
+
+            // 4. Nguyên tắc: Điện thoại bật "Desktop Mode" vẫn có touch và màn hình nhỏ/coarse pointer
+            if (hasTouch && (isMobileUa || isIpadOs || isCoarse || isSmallScreen)) {
+                this.currentMode = this.MODE_MOBILE;
+            } else {
+                this.currentMode = this.MODE_DESKTOP;
+            }
+
+            currentSession.detectedEnvironment = this.currentMode;
+            console.log(`%c[DeviceCompatibilityManager] Môi trường xác định: ${this.currentMode} (touch=${hasTouch}, coarsePointer=${isCoarse}, uaMobile=${isMobileUa}, viewport=${window.innerWidth}x${window.innerHeight})`, 'color: #00d2ff; font-weight: bold;');
+            return this.currentMode;
+        },
+
+        isDesktop() {
+            if (!this.currentMode) this.detect();
+            return this.currentMode === this.MODE_DESKTOP;
+        },
+
+        isMobile() {
+            if (!this.currentMode) this.detect();
+            return this.currentMode === this.MODE_MOBILE;
+        }
+    };
+
+    // =========================================================================
+    // 3. BỘ ĐỆM LƯU TRỮ ĐA MÔI TRƯỜNG (STORAGE ADAPTER - MỤC 16.7 & 22)
+    // Phân tách nghiêm ngặt: Nhóm A (Lưu) vs Nhóm B (Không lưu)
     // =========================================================================
     const StorageAdapter = {
         get(key, defaultValue) {
-            // 1. Thử đọc từ GM_getValue (Tampermonkey / Violentmonkey)
+            // 1. Thử đọc từ GM_getValue (Tampermonkey, Violentmonkey)
             try {
                 if (typeof GM_getValue === 'function') {
                     const gmVal = GM_getValue(key, undefined);
@@ -86,7 +138,7 @@ Dữ liệu cần dịch:`
                 }
             } catch (err) {}
 
-            // 2. Thử đọc từ window.localStorage (Userscripts iOS, Webview tiêu chuẩn)
+            // 2. Thử đọc từ window.localStorage (Userscripts iOS, Web tiêu chuẩn)
             try {
                 if (typeof window !== 'undefined' && window.localStorage) {
                     const localVal = window.localStorage.getItem(key);
@@ -111,7 +163,7 @@ Dữ liệu cần dịch:`
                 }
             } catch (err) {}
 
-            // 2. Ghi đồng thời vào localStorage để bảo toàn dữ liệu trên mọi thiết bị
+            // 2. Ghi đồng thời vào localStorage để bảo toàn dữ liệu
             try {
                 if (typeof window !== 'undefined' && window.localStorage) {
                     const serialized = (typeof value === 'object') ? JSON.stringify(value) : String(value);
@@ -130,12 +182,13 @@ Dữ liệu cần dịch:`
         }
     };
 
+    // Chỉ đọc/ghi các thông số cấu hình Nhóm A
     function loadUserConfig() {
         let rawMode = StorageAdapter.get(CONFIG.CONFIG_KEY_MODE, 'lines');
         let rawBatch = StorageAdapter.get(CONFIG.CONFIG_KEY_BATCH, CONFIG.DEFAULT_BATCH_SIZE);
 
         userSettings.mode = (rawMode === 'all') ? 'all' : 'lines';
-        
+
         let parsedBatch = parseInt(rawBatch, 10);
         if (isNaN(parsedBatch) || parsedBatch < 5 || parsedBatch > 2000) {
             parsedBatch = CONFIG.DEFAULT_BATCH_SIZE;
@@ -155,7 +208,7 @@ Dữ liệu cần dịch:`
     }
 
     // =========================================================================
-    // 3. CÔNG CỤ XỬ LÝ SRT & KIỂM TRA CHẤT LƯỢNG (PORT TỪ PYTHON TOOL PC)
+    // 4. CÔNG CỤ XỬ LÝ SRT & KIỂM TRA CHẤT LƯỢNG (PORT TỪ PYTHON TOOL PC)
     // =========================================================================
 
     function containsChinese(text) {
@@ -186,7 +239,6 @@ Dữ liệu cần dịch:`
             if (origHasChinese) {
                 return { valid: false, reason: 'Chưa dịch (nguyên văn tiếng Trung)' };
             }
-            // Không có chữ Hán (chỉ số, timeline, ký hiệu) thì giữ nguyên là hợp lệ
             return { valid: true, reason: 'OK' };
         }
 
@@ -246,7 +298,7 @@ Dữ liệu cần dịch:`
         const cleaned = cleanMarkdown(rawText);
         const resultMap = {};
 
-        // 1. Phân tích định dạng #ID Nội dung
+        // 1. Phân tích định dạng chuẩn #ID Nội dung
         const lines = cleaned.split('\n');
         const lineRegex = /^#\s*(\d+)[\s:：.\-]+(.*)$/;
 
@@ -256,7 +308,6 @@ Dữ liệu cần dịch:`
             if (match) {
                 const id = parseInt(match[1], 10);
                 let content = match[2].trim();
-                // Loại bỏ timeline nếu AI lỡ sinh kèm trên cùng dòng
                 if (content.includes('-->') || content.includes('->')) {
                     content = content.replace(/\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*(?:-->|->)\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}/g, '').trim();
                 }
@@ -266,7 +317,7 @@ Dữ liệu cần dịch:`
             }
         }
 
-        // 2. Fallback: Nếu AI trả về nguyên khối SRT
+        // 2. Fallback: Nếu AI tự sinh lại nguyên khối SRT kèm timestamp
         if (Object.keys(resultMap).length === 0 && cleaned.includes('-->')) {
             const srtBlocks = cleaned.split(/\n\s*\n/);
             for (const block of srtBlocks) {
@@ -294,7 +345,7 @@ Dữ liệu cần dịch:`
     }
 
     // =========================================================================
-    // 4. TƯƠNG TÁC DOM DEEPSEEK TRÊN MOBILE
+    // 5. TƯƠNG TÁC DOM DEEPSEEK (PHÂN BIỆT RÕ PC VÀ MOBILE - MỤC 18)
     // =========================================================================
 
     function sleep(ms) {
@@ -322,7 +373,7 @@ Dữ liệu cần dịch:`
         return null;
     }
 
-    // Nhập nội dung vào textarea/contenteditable và kích hoạt sự kiện cho Vue/React
+    // Đưa nội dung nhiều dòng vào ô nhập
     function setInputValue(element, text) {
         element.focus();
         if (element.tagName.toLowerCase() === 'textarea') {
@@ -336,13 +387,23 @@ Dữ liệu cần dịch:`
             element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
             element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
         } else {
-            // contenteditable
             element.innerText = text;
             element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
         }
     }
 
-    // Tìm nút gửi tin nhắn thực tế của DeepSeek (Không dùng Enter trên mobile!)
+    // Cơ chế PC: Gửi bằng phím Enter đúng như tool PC (browser_controller.py dòng 1920)
+    function sendViaKeyboardEnter(composer) {
+        composer.focus();
+        const evtDown = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+        const evtPress = new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+        const evtUp = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+        composer.dispatchEvent(evtDown);
+        composer.dispatchEvent(evtPress);
+        composer.dispatchEvent(evtUp);
+    }
+
+    // Cơ chế Mobile: Tìm nút gửi thực tế của DeepSeek
     function findSendButton() {
         const selectors = [
             'div[role="button"][class*="ds-button--primary"]',
@@ -460,41 +521,152 @@ Dữ liệu cần dịch:`
         return list.length;
     }
 
-    async function createNewChat() {
-        const buttons = document.querySelectorAll('div[role="button"], button, a[href="/"]');
-        for (const btn of buttons) {
-            if (btn.offsetParent !== null) {
-                const text = (btn.innerText || '').trim().toLowerCase();
-                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                if (text.includes('new chat') || text.includes('chat mới') || aria.includes('new chat') || aria.includes('chat mới')) {
-                    clickButton(btn);
-                    await sleep(1500);
-                    return true;
-                }
-                const svg = btn.querySelector('svg');
-                if (svg && svg.getAttribute('viewBox') === '0 0 16 16') {
-                    clickButton(btn);
-                    await sleep(1500);
-                    return true;
+    // =========================================================================
+    // 5.1. NHẬN DIỆN VÀ TẠO CHAT MỚI DEEPSEEK (HTML THỰC TẾ MỚI NHẤT)
+    // Căn cứ HTML: div[role="button"].ds-button--iconLabelPrimary.ds-button--capsule
+    // chứa svg viewBox="0 0 20 20" (Icon dấu cộng)
+    // =========================================================================
+
+    function findNewChatButton() {
+        // 1. Selector ưu tiên chính xác theo cấu trúc HTML thực tế của DeepSeek
+        const primarySelectors = [
+            'div[role="button"].ds-button--iconLabelPrimary.ds-button--capsule',
+            'div[role="button"][class*="ds-button--iconLabelPrimary"][class*="ds-button--capsule"]',
+            'div[role="button"].ds-button--iconLabelPrimary',
+            'div[role="button"][class*="ds-button--capsule"]:has(.ds-button__icon)'
+        ];
+
+        for (const sel of primarySelectors) {
+            const buttons = document.querySelectorAll(sel);
+            for (const btn of buttons) {
+                // Kiểm tra hiển thị thực tế trên màn hình
+                if (btn.offsetParent === null && btn.getClientRects().length === 0) continue;
+                // Kiểm tra không bị vô hiệu hóa
+                if (btn.getAttribute('aria-disabled') === 'true' || btn.hasAttribute('disabled')) continue;
+
+                // Kiểm tra icon SVG bên trong (.ds-button__icon hoặc svg con)
+                const svg = btn.querySelector('.ds-button__icon svg, svg');
+                if (svg) {
+                    const vb = (svg.getAttribute('viewBox') || '').trim();
+                    const w = (svg.getAttribute('width') || '').trim();
+                    const h = (svg.getAttribute('height') || '').trim();
+                    // Nút tạo chat mới của DeepSeek có SVG 20x20
+                    if (vb === '0 0 20 20' || (w === '20' && h === '20') || vb === '0 0 16 16') {
+                        return btn;
+                    }
                 }
             }
         }
 
-        try {
-            const homeLink = document.querySelector('a[href="/"]');
-            if (homeLink) {
-                homeLink.click();
-                await sleep(1500);
-                return true;
+        // 2. Fallback dự phòng: Quét các button có icon SVG 20x20 hoặc text/aria new chat
+        const allCandidates = document.querySelectorAll('div[role="button"], button');
+        for (const c of allCandidates) {
+            if (c.offsetParent === null && c.getClientRects().length === 0) continue;
+            if (c.getAttribute('aria-disabled') === 'true' || c.hasAttribute('disabled')) continue;
+
+            const svg = c.querySelector('svg');
+            if (svg) {
+                const vb = (svg.getAttribute('viewBox') || '').trim();
+                const text = (c.innerText || '').trim().toLowerCase();
+                const aria = (c.getAttribute('aria-label') || '').toLowerCase();
+                if (vb === '0 0 20 20' || text.includes('new chat') || text.includes('chat mới') || aria.includes('new chat') || aria.includes('chat mới')) {
+                    return c;
+                }
             }
-        } catch (e) {
-            console.warn('[KageVietSub] Fallback new chat failed:', e);
         }
-        return false;
+
+        return null;
+    }
+
+    async function createNewChat(maxAttempts = 3) {
+        console.log('%c[KageVietSub NewChat] Bắt đầu quy trình tạo hội thoại mới...', 'color: #00d2ff; font-weight: bold;');
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (currentSession.stopRequested) {
+                console.log('[KageVietSub NewChat] Hủy tạo chat mới do người dùng yêu cầu dừng.');
+                return false;
+            }
+
+            console.log(`[KageVietSub NewChat] Lần thử ${attempt}/${maxAttempts}:`);
+
+            // Bước 1: Tìm nút tạo chat mới theo cấu trúc chuẩn
+            console.log('[KageVietSub NewChat] Bước 1: Đang tìm nút tạo chat mới theo cấu trúc chuẩn...');
+            let newChatBtn = null;
+            const findStart = Date.now();
+            while (Date.now() - findStart < 4000) {
+                newChatBtn = findNewChatButton();
+                if (newChatBtn) break;
+                await sleep(300);
+            }
+
+            if (!newChatBtn) {
+                console.warn(`[KageVietSub NewChat] Lần ${attempt}: Không tìm thấy nút New Chat (capsule plus SVG). Đang thử lại...`);
+                await sleep(1000);
+                continue;
+            }
+
+            // Bước 2: Kiểm tra nút hiển thị và không bị vô hiệu hóa
+            const isVisible = (newChatBtn.offsetParent !== null || newChatBtn.getClientRects().length > 0);
+            const isDisabled = (newChatBtn.getAttribute('aria-disabled') === 'true' || newChatBtn.hasAttribute('disabled'));
+
+            if (!isVisible || isDisabled) {
+                console.warn(`[KageVietSub NewChat] Lần ${attempt}: Nút New Chat đang bị ẩn hoặc disabled.`);
+                await sleep(1000);
+                continue;
+            }
+
+            console.log('[KageVietSub NewChat] Bước 2: Đã xác định chính xác nút New Chat:', newChatBtn);
+
+            // Lưu trạng thái trước khi click để đối chiếu xác nhận
+            const initialUrl = window.location.href;
+            const initialMsgCount = getAssistantMessageCount();
+
+            // Bước 3: Click đúng một lần
+            console.log('[KageVietSub NewChat] Bước 3: Đang click vào nút New Chat (duy nhất 1 lần)...');
+            clickButton(newChatBtn);
+
+            // Bước 4: Chờ giao diện hội thoại mới xuất hiện
+            console.log('[KageVietSub NewChat] Bước 4: Đang chờ giao diện hội thoại mới xuất hiện...');
+            const waitStart = Date.now();
+            let stateChanged = false;
+
+            while (Date.now() - waitStart < 6000) {
+                if (currentSession.stopRequested) return false;
+
+                const curUrl = window.location.href;
+                const curMsgCount = getAssistantMessageCount();
+                const curInput = findChatInput();
+
+                // Xác nhận hội thoại mới qua URL đổi hoặc danh sách tin nhắn được làm mới
+                if (curUrl !== initialUrl || curMsgCount < initialMsgCount || (curMsgCount === 0 && curInput)) {
+                    stateChanged = true;
+                    break;
+                }
+                await sleep(400);
+            }
+
+            // Bước 5: Kiểm tra ô nhập tin nhắn đã sẵn sàng
+            console.log('[KageVietSub NewChat] Bước 5: Kiểm tra ô nhập tin nhắn...');
+            await sleep(500);
+            const finalInput = findChatInput();
+
+            if (finalInput) {
+                console.log('%c[KageVietSub NewChat] THÀNH CÔNG: Hội thoại mới và ô nhập tin nhắn đã sẵn sàng!', 'color: #10b981; font-weight: bold;');
+                return true;
+            } else {
+                console.warn(`[KageVietSub NewChat] Lần ${attempt}: Ô nhập tin nhắn chưa sẵn sàng sau khi click.`);
+                await sleep(1000);
+            }
+        }
+
+        const errMsg = 'Không thể tạo cuộc trò chuyện mới trên DeepSeek sau 3 lần thử. Vui lòng kiểm tra lại giao diện.';
+        console.error(`[KageVietSub NewChat] ${errMsg}`);
+        updateUIStatus(`Lỗi: ${errMsg}`);
+        throw new Error(errMsg);
     }
 
     // =========================================================================
-    // 5. TIẾN TRÌNH DỊCH & THEO DÕI PHẢN HỒI
+    // 6. TIẾN TRÌNH GỬI TIN NHẮN (ÁP DỤNG CƠ CHẾ ĐÚNG CHO TỪNG THIẾT BỊ)
     // =========================================================================
 
     async function sendMessageAndWaitConfirmation(textToSend, maxWaitMs = 8000) {
@@ -506,21 +678,40 @@ Dữ liệu cần dịch:`
         setInputValue(input, textToSend);
         await sleep(500);
 
-        let sendBtn = null;
-        const startFind = Date.now();
-        while (Date.now() - startFind < 4000) {
-            sendBtn = findSendButton();
-            if (sendBtn) break;
-            await sleep(200);
-        }
-
-        if (!sendBtn) {
-            throw new Error('Nút gửi (Send button) chưa sẵn sàng hoặc không tìm thấy.');
-        }
-
         const baselineCount = getAssistantMessageCount();
-        clickButton(sendBtn);
+        const isDesktop = DeviceCompatibilityManager.isDesktop();
 
+        if (isDesktop) {
+            // PC: Thực hiện gửi bằng phím Enter y hệt tool PC gốc
+            console.log('[KageVietSub Send] Thực thi cơ chế DESKTOP: Gửi bằng phím Enter...');
+            sendViaKeyboardEnter(input);
+
+            // Kiểm tra và retry Enter sau 1.5s nếu chưa gửi được
+            await sleep(1500);
+            const curVal = (input.tagName.toLowerCase() === 'textarea' ? input.value : input.innerText) || '';
+            if (curVal.length > 0 && !isAiGenerating() && !isAiThinking()) {
+                console.log('[KageVietSub Send] Thử lại Enter lần 2 trên PC...');
+                sendViaKeyboardEnter(input);
+            }
+        } else {
+            // MOBILE: Tuyệt đối không bấm Enter; tìm nút gửi và click thực tế
+            console.log('[KageVietSub Send] Thực thi cơ chế MOBILE: Tìm và click nút gửi thực tế...');
+            let sendBtn = null;
+            const startFind = Date.now();
+            while (Date.now() - startFind < 4000) {
+                sendBtn = findSendButton();
+                if (sendBtn) break;
+                await sleep(200);
+            }
+
+            if (!sendBtn) {
+                throw new Error('Nút gửi (Send button) chưa sẵn sàng hoặc không tìm thấy trên điện thoại.');
+            }
+
+            clickButton(sendBtn);
+        }
+
+        // Chờ xác nhận đã gửi thành công
         const startConfirm = Date.now();
         while (Date.now() - startConfirm < maxWaitMs) {
             if (currentSession.stopRequested) return false;
@@ -580,7 +771,95 @@ Dữ liệu cần dịch:`
         return lastText;
     }
 
-    async function processBatchWithRetries(batchItems, batchIdx, totalBatches) {
+    // =========================================================================
+    // 7. PHỤC HỒI KHI DEEPSEEK ĐẠT GIỚI HẠN ĐỘ DÀI (LENGTH LIMIT RECOVERY)
+    // Port nguyên vẹn từ recover_deepseek_length_limit trong translator.py
+    // =========================================================================
+    async function recoverDeepSeekLengthLimit(batchItems, activePrompt, batchIdx, totalBatches) {
+        console.warn('[KageVietSub Recovery] Kích hoạt quy trình phục hồi Length Limit chuẩn PC...');
+        updateUIStatus('Phát hiện DeepSeek Length Limit! Đang tạo chat mới và nạp ngữ cảnh...');
+
+        const itemMap = new Map(batchItems.map(it => [it.id, it]));
+        const expectedIds = batchItems.map(it => it.id);
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            if (currentSession.stopRequested) return false;
+
+            const missingIds = expectedIds.filter(id => {
+                const it = itemMap.get(id);
+                return !it || !it.translated || it.status !== 'translated';
+            });
+
+            if (missingIds.length === 0) {
+                updateUIStatus('Khôi phục thành công! Đã dịch đủ các câu.');
+                return true;
+            }
+
+            updateUIStatus(`Khôi phục lần ${attempt}/3: Mở chat mới cho ${missingIds.length} câu còn thiếu...`);
+            const newChatOk = await createNewChat();
+            if (!newChatOk) {
+                await sleep(1500);
+                continue;
+            }
+            await sleep(1500);
+
+            // Xây dựng thông điệp phục hồi kèm câu ngữ cảnh tham chiếu liền trước (nếu có)
+            const contextItem = currentSession.lastCompletedItem;
+            let contextBlock = '';
+            const firstMissingId = missingIds[0];
+
+            if (contextItem) {
+                contextBlock = `--- [DÒNG NGỮ CẢNH THAM CHIẾU - BẮT BUỘC ĐỌC KỸ] ---
+Dưới đây là câu liền trước đã dịch thành công, cung cấp DUY NHẤT để bạn nắm bắt mạch nội dung:
+#${contextItem.id} [Gốc]: ${normalizeText(contextItem.original)}
+#${contextItem.id} [Đã dịch]: ${normalizeText(contextItem.translated || '')}
+
+QUY TẮC BẮT BUỘC VỀ DÒNG NGỮ CẢNH:
+- Đây là dòng ngữ cảnh để AI hiểu mạch nội dung.
+- AI TUYỆT ĐỐI KHÔNG ĐƯỢC dịch lại câu #${contextItem.id}.
+- AI TUYỆT ĐỐI KHÔNG ĐƯỢC đưa câu #${contextItem.id} vào kết quả trả về.
+- Bắt đầu dịch chính xác từ câu #${firstMissingId} (đoạn bị thiếu đầu tiên).
+- Giữ nguyên số thứ tự #${firstMissingId} trở đi và định dạng chuẩn.
+---------------------------------------------------\n\n`;
+            }
+
+            const missingLines = missingIds.map(id => `#${id} ${itemMap.get(id).original}`).join('\n');
+            const recoveryMessage = `${activePrompt}\n\n${contextBlock}DANH SÁCH CÁC CÂU CẦN DỊCH (Bắt đầu chính xác từ #${firstMissingId}):\n${missingLines}`;
+
+            const sent = await sendMessageAndWaitConfirmation(recoveryMessage);
+            if (!sent) {
+                await sleep(1000);
+                continue;
+            }
+
+            const resp = await monitorAiResponse();
+            const missingSet = new Set(missingIds);
+            const parsed = parseAiResponse(resp, missingSet);
+
+            for (const [idStr, trans] of Object.entries(parsed)) {
+                const id = Number(idStr);
+                // Bỏ qua dòng ngữ cảnh nếu AI lỡ trả lại
+                if (contextItem && id === contextItem.id) continue;
+
+                const it = itemMap.get(id);
+                if (it && isTranslationValid(it.original, trans).valid) {
+                    it.translated = trans;
+                    it.status = 'translated';
+                    currentSession.lastCompletedItem = it;
+                }
+            }
+
+            updateSessionProgress();
+        }
+
+        const stillMissing = expectedIds.filter(id => !itemMap.get(id).translated);
+        return stillMissing.length === 0;
+    }
+
+    // =========================================================================
+    // 8. TIẾN TRÌNH DỊCH TỪNG ĐOẠN & RETRY THIẾU DÒNG (SMART RETRY)
+    // =========================================================================
+    async function processBatchWithRetries(batchItems, activePrompt, batchIdx, totalBatches) {
         const expectedIds = batchItems.map(it => it.id);
         const expectedSet = new Set(expectedIds);
         const itemMap = new Map(batchItems.map(it => [it.id, it]));
@@ -588,7 +867,7 @@ Dữ liệu cần dịch:`
         updateUIStatus(`Đang dịch đoạn ${batchIdx}/${totalBatches}...`);
 
         const dataLines = batchItems.map(it => `#${it.id} ${it.original}`).join('\n');
-        const initialPrompt = `${CONFIG.DEFAULT_PROMPT}\n\n${dataLines}`;
+        const initialPrompt = `${activePrompt}\n\n${dataLines}`;
 
         const sent = await sendMessageAndWaitConfirmation(initialPrompt);
         if (!sent) {
@@ -597,17 +876,31 @@ Dữ liệu cần dịch:`
 
         updateUIStatus(`Đang chờ DeepSeek trả lời đoạn ${batchIdx}/${totalBatches}...`);
 
-        let responseText = await monitorAiResponse((text) => {
-            const partial = parseAiResponse(text, expectedSet);
-            for (const [id, trans] of Object.entries(partial)) {
-                const it = itemMap.get(Number(id));
-                if (it && isTranslationValid(it.original, trans).valid) {
-                    it.translated = trans;
-                    it.status = 'translated';
+        let responseText = '';
+        try {
+            responseText = await monitorAiResponse((text) => {
+                const partial = parseAiResponse(text, expectedSet);
+                for (const [id, trans] of Object.entries(partial)) {
+                    const it = itemMap.get(Number(id));
+                    if (it && isTranslationValid(it.original, trans).valid) {
+                        it.translated = trans;
+                        it.status = 'translated';
+                        currentSession.lastCompletedItem = it;
+                    }
                 }
+                updateSessionProgress();
+            });
+        } catch (err) {
+            if (err.message === 'DEEPSEEK_LENGTH_LIMIT') {
+                const recovered = await recoverDeepSeekLengthLimit(batchItems, activePrompt, batchIdx, totalBatches);
+                if (!recovered) {
+                    throw new Error(`Đoạn ${batchIdx} bị ngắt bởi Length Limit và không thể phục hồi.`);
+                }
+                saveSessionToStorage();
+                return true;
             }
-            updateSessionProgress();
-        });
+            throw err;
+        }
 
         let parsedResults = parseAiResponse(responseText, expectedSet);
         for (const [idStr, trans] of Object.entries(parsedResults)) {
@@ -618,11 +911,12 @@ Dữ liệu cần dịch:`
                 if (check.valid) {
                     it.translated = trans;
                     it.status = 'translated';
+                    currentSession.lastCompletedItem = it;
                 }
             }
         }
 
-        // Retry nếu thiếu dòng
+        // Vòng lặp Smart Retry nếu thiếu câu (tối đa CONFIG.MAX_RETRIES)
         let retryAttempt = 1;
         while (retryAttempt <= CONFIG.MAX_RETRIES && !currentSession.stopRequested) {
             const missingItems = batchItems.filter(it => !it.translated || it.status !== 'translated');
@@ -649,7 +943,17 @@ ${missingLines}`;
                 continue;
             }
 
-            const retryResponse = await monitorAiResponse();
+            let retryResponse = '';
+            try {
+                retryResponse = await monitorAiResponse();
+            } catch (err) {
+                if (err.message === 'DEEPSEEK_LENGTH_LIMIT') {
+                    await recoverDeepSeekLengthLimit(batchItems, activePrompt, batchIdx, totalBatches);
+                    break;
+                }
+                throw err;
+            }
+
             const missingSet = new Set(missingItems.map(it => it.id));
             const retryParsed = parseAiResponse(retryResponse, missingSet);
 
@@ -661,6 +965,7 @@ ${missingLines}`;
                     if (check.valid) {
                         it.translated = trans;
                         it.status = 'translated';
+                        currentSession.lastCompletedItem = it;
                     }
                 }
             }
@@ -678,13 +983,25 @@ ${missingLines}`;
         return true;
     }
 
+    // =========================================================================
+    // 9. TIẾN TRÌNH DỊCH TOÀN BỘ FILE (START TRANSLATION PIPELINE)
+    // =========================================================================
     async function startTranslationProcess() {
         if (!currentSession.items || currentSession.items.length === 0) {
             alert('Vui lòng chọn file phụ đề SRT trước.');
             return;
         }
 
-        // 1. Kiểm tra cấu hình và cảnh báo nếu chọn Gửi toàn bộ
+        // 1. Tự động xác định môi trường trình duyệt trước khi chạy (Mục 18)
+        DeviceCompatibilityManager.detect();
+
+        // 2. Xác định Prompt AI sử dụng (Mục 20)
+        // Nếu người dùng nhập prompt tùy chỉnh, thay thế hoàn toàn prompt gốc. Nếu để trống, dùng prompt gốc.
+        const customPromptText = (uiElements.customPromptInput ? uiElements.customPromptInput.value : '').trim();
+        const activePrompt = customPromptText || CONFIG.DEFAULT_PROMPT;
+        console.log(`[KageVietSub Prompt] Đang sử dụng: ${customPromptText ? 'PROMPT TÙY CHỈNH (In-memory)' : 'PROMPT GỐC CỦA TOOL PC'}`);
+
+        // 3. Kiểm tra cấu hình và cảnh báo nếu chọn Gửi toàn bộ
         const totalItems = currentSession.items.length;
         const mode = userSettings.mode;
         let batchSize = userSettings.batchSize;
@@ -731,8 +1048,9 @@ ${missingLines}`;
                 const endIdx = Math.min(startIdx + batchSize, totalItems);
                 const batchItems = currentSession.items.slice(startIdx, endIdx);
 
-                await processBatchWithRetries(batchItems, b + 1, totalBatches);
+                await processBatchWithRetries(batchItems, activePrompt, b + 1, totalBatches);
 
+                // Sau mỗi batch hoàn thành, nếu còn batch tiếp theo -> tạo New Chat để giải phóng context
                 if (b + 1 < totalBatches && !currentSession.stopRequested) {
                     updateUIStatus(`Đang tạo cuộc trò chuyện mới cho đoạn ${b + 2}/${totalBatches}...`);
                     await createNewChat();
@@ -753,21 +1071,8 @@ ${missingLines}`;
 
         } catch (error) {
             console.error('[KageVietSub Error]', error);
-            if (error.message === 'DEEPSEEK_LENGTH_LIMIT') {
-                if (mode === 'all') {
-                    alert('DeepSeek đã đạt giới hạn độ dài hội thoại trong chế độ Gửi toàn bộ!\n\nKhuyên dùng: Hãy chuyển sang "Gửi theo số dòng" (50 hoặc 100 dòng/lần) để dịch từng đoạn an toàn.');
-                    updateUIStatus('Gặp lỗi giới hạn độ dài. Hãy chuyển sang "Gửi theo số dòng".');
-                } else {
-                    updateUIStatus('DeepSeek đạt giới hạn độ dài! Đang mở chat mới và thử lại...');
-                    await createNewChat();
-                    await sleep(2000);
-                    setTimeout(startTranslationProcess, 1000);
-                    return;
-                }
-            } else {
-                updateUIStatus(`Lỗi: ${error.message || error}`);
-                alert(`Lỗi trong quá trình dịch: ${error.message || error}`);
-            }
+            updateUIStatus(`Lỗi: ${error.message || error}`);
+            alert(`Lỗi trong quá trình dịch: ${error.message || error}`);
         } finally {
             currentSession.isTranslating = false;
             updateUIState(false);
@@ -775,7 +1080,7 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 6. TẠO VÀ TỰ ĐỘNG TẢI FILE SRT HOÀN CHỈNH
+    // 10. XUẤT VÀ TẢI FILE SRT HOÀN CHỈNH
     // =========================================================================
 
     function buildCompleteSrtContent() {
@@ -810,8 +1115,23 @@ ${missingLines}`;
         }, 2000);
     }
 
+    // Nút tải prompt AI mẫu về thiết bị dưới dạng file .txt (Mục 21)
+    function downloadSamplePrompt() {
+        const blob = new Blob([CONFIG.DEFAULT_PROMPT], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'KAGEVIETSUB_DeepSeek_Prompt_Mau.txt';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 2000);
+    }
+
     // =========================================================================
-    // 7. LƯU VÀ KHÔI PHỤC TIẾN TRÌNH (SESSION STORAGE QUA STORAGE ADAPTER)
+    // 11. LƯU VÀ KHÔI PHỤC TIẾN TRÌNH PHIÊN
     // =========================================================================
 
     function saveSessionToStorage() {
@@ -846,7 +1166,7 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 8. GIAO DIỆN NGƯỜI DÙNG MOBILE (HTML + CSS) - CẬP NHẬT MỤC 16
+    // 12. GIAO DIỆN NGƯỜI DÙNG (RESPONSIVE PC & MOBILE - MỤC 18, 20, 21)
     // =========================================================================
 
     let uiElements = {
@@ -860,12 +1180,167 @@ ${missingLines}`;
         batchSizeContainer: null,
         batchSelect: null,
         batchCustomInput: null,
+        promptToggleBtn: null,
+        promptBody: null,
+        customPromptInput: null,
+        downloadSamplePromptBtn: null,
         startBtn: null,
         progressLabel: null,
         progressBar: null,
         statusLabel: null,
         collapseBtn: null,
         contentBody: null
+    };
+
+    // =========================================================================
+    // 11.1. QUẢN LÝ KÉO THẢ & GHI NHỚ VỊ TRÍ MENU (POSITION & DRAG MANAGER)
+    // =========================================================================
+    const PositionManager = {
+        STORAGE_KEY: 'kg_pref_widget_position',
+
+        clamp(left, top, elemWidth, elemHeight) {
+            const winW = window.innerWidth || document.documentElement.clientWidth || 390;
+            const winH = window.innerHeight || document.documentElement.clientHeight || 844;
+            const w = elemWidth || 350;
+
+            // Đảm bảo menu không bị kéo hoàn toàn ra ngoài màn hình
+            const maxLeft = Math.max(0, winW - Math.min(w, winW));
+            const clampedLeft = Math.max(0, Math.min(left, maxLeft));
+
+            // Đảm bảo thanh tiêu đề (ít nhất 45px) luôn nằm trong tầm với
+            const maxTop = Math.max(0, winH - 45);
+            const clampedTop = Math.max(0, Math.min(top, maxTop));
+
+            return { left: Math.round(clampedLeft), top: Math.round(clampedTop) };
+        },
+
+        save(left, top) {
+            try {
+                StorageAdapter.set(this.STORAGE_KEY, { left, top, timestamp: Date.now() });
+                console.log(`[PositionManager] Đã lưu vị trí menu: left=${left}px, top=${top}px`);
+            } catch (e) {}
+        },
+
+        load() {
+            try {
+                const pos = StorageAdapter.get(this.STORAGE_KEY, null);
+                if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+                    return pos;
+                }
+            } catch (e) {}
+            return null;
+        },
+
+        applySaved(container) {
+            const pos = this.load();
+            if (pos && container) {
+                const rect = container.getBoundingClientRect();
+                const w = rect.width || 350;
+                const h = rect.height || 120;
+                const clamped = this.clamp(pos.left, pos.top, w, h);
+                container.style.left = `${clamped.left}px`;
+                container.style.top = `${clamped.top}px`;
+                container.style.right = 'auto';
+                container.style.bottom = 'auto';
+                return true;
+            }
+            return false;
+        },
+
+        attachDrag(headerEl, containerEl) {
+            if (!headerEl || !containerEl) return;
+
+            headerEl.style.cursor = 'grab';
+            headerEl.style.touchAction = 'none';
+
+            let isDragging = false;
+            let startPointerX = 0;
+            let startPointerY = 0;
+            let startLeft = 0;
+            let startTop = 0;
+            let hasMoved = false;
+
+            headerEl.addEventListener('pointerdown', (e) => {
+                // Chỉ nhận chuột trái (button 0) hoặc touch/pen
+                if (e.button !== undefined && e.button !== 0) return;
+
+                // Không kích hoạt kéo khi nhấn vào các nút chức năng bên trong
+                if (e.target.closest('button, #kg-collapse-btn, #kg-minimize-btn, #kg-vp-toggle-btn, input, select')) {
+                    return;
+                }
+
+                const rect = containerEl.getBoundingClientRect();
+                isDragging = true;
+                hasMoved = false;
+                startPointerX = e.clientX;
+                startPointerY = e.clientY;
+                startLeft = rect.left;
+                startTop = rect.top;
+
+                headerEl.style.cursor = 'grabbing';
+                try {
+                    headerEl.setPointerCapture(e.pointerId);
+                } catch (err) {}
+                e.preventDefault();
+            });
+
+            headerEl.addEventListener('pointermove', (e) => {
+                if (!isDragging) return;
+
+                const dx = e.clientX - startPointerX;
+                const dy = e.clientY - startPointerY;
+
+                // Ngưỡng phát hiện kéo (3px) để tránh giật khi click
+                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+                    hasMoved = true;
+                }
+
+                if (hasMoved) {
+                    const rect = containerEl.getBoundingClientRect();
+                    const rawLeft = startLeft + dx;
+                    const rawTop = startTop + dy;
+                    const clamped = PositionManager.clamp(rawLeft, rawTop, rect.width, rect.height);
+
+                    containerEl.style.left = `${clamped.left}px`;
+                    containerEl.style.top = `${clamped.top}px`;
+                    containerEl.style.right = 'auto';
+                    containerEl.style.bottom = 'auto';
+                }
+            });
+
+            const stopDrag = (e) => {
+                if (!isDragging) return;
+                isDragging = false;
+                headerEl.style.cursor = 'grab';
+
+                try {
+                    if (headerEl.hasPointerCapture(e.pointerId)) {
+                        headerEl.releasePointerCapture(e.pointerId);
+                    }
+                } catch (err) {}
+
+                if (hasMoved) {
+                    const rect = containerEl.getBoundingClientRect();
+                    const clamped = PositionManager.clamp(rect.left, rect.top, rect.width, rect.height);
+                    PositionManager.save(clamped.left, clamped.top);
+                }
+            };
+
+            headerEl.addEventListener('pointerup', stopDrag);
+            headerEl.addEventListener('pointercancel', stopDrag);
+
+            // Tự động căn chỉnh khi xoay màn hình điện thoại hoặc thay đổi kích thước cửa sổ
+            window.addEventListener('resize', () => {
+                if (containerEl && containerEl.style.left && containerEl.style.left !== 'auto') {
+                    const rect = containerEl.getBoundingClientRect();
+                    const curLeft = parseInt(containerEl.style.left, 10) || rect.left;
+                    const curTop = parseInt(containerEl.style.top, 10) || rect.top;
+                    const clamped = PositionManager.clamp(curLeft, curTop, rect.width, rect.height);
+                    containerEl.style.left = `${clamped.left}px`;
+                    containerEl.style.top = `${clamped.top}px`;
+                }
+            });
+        }
     };
 
     function injectUI() {
@@ -880,7 +1355,7 @@ ${missingLines}`;
             top: 10px;
             right: 10px;
             width: calc(100vw - 20px);
-            max-width: 340px;
+            max-width: 350px;
             background: #18191f;
             color: #e6e6e6;
             border: 1px solid #333544;
@@ -903,7 +1378,9 @@ ${missingLines}`;
                 padding: 10px 14px;
                 background: #20222c;
                 border-bottom: 1px solid #333544;
-                cursor: pointer;
+                cursor: grab;
+                touch-action: none;
+                user-select: none;
             ">
                 <span style="font-weight: 700; color: #4e8cff; letter-spacing: 0.5px;">KAGEVIETSUB TRANSLATOR</span>
                 <span id="kg-collapse-btn" style="
@@ -915,9 +1392,10 @@ ${missingLines}`;
                     display: flex;
                     align-items: center;
                     justify-content: center;
+                    cursor: pointer;
                 ">−</span>
             </div>
-            <div id="kg-body" style="padding: 12px 14px; display: flex; flex-direction: column; gap: 9px;">
+            <div id="kg-body" style="padding: 12px 14px; display: flex; flex-direction: column; gap: 9px; max-height: calc(100vh - 80px); overflow-y: auto;">
                 <input type="file" id="kg-file-input" accept=".srt" style="display: none;" />
                 <button id="kg-select-file-btn" style="
                     background: #282a36;
@@ -1004,6 +1482,53 @@ ${missingLines}`;
                             outline: none;
                             box-sizing: border-box;
                         " />
+                    </div>
+                </div>
+
+                <!-- KHU VỰC PROMPT AI TÙY CHỌN (MỤC 20 & 21) -->
+                <div style="border: 1px solid #2b2e3b; border-radius: 6px; overflow: hidden; background: #1c1d25;">
+                    <div id="kg-prompt-header" style="
+                        padding: 7px 10px;
+                        background: #22242f;
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        cursor: pointer;
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: #cfd3dc;
+                    ">
+                        <span>PROMPT AI (Tùy chọn)</span>
+                        <span id="kg-prompt-toggle-btn" style="color: #4e8cff; font-weight: bold;">+</span>
+                    </div>
+                    <div id="kg-prompt-body" style="display: none; padding: 10px; flex-direction: column; gap: 8px;">
+                        <textarea id="kg-custom-prompt-input" placeholder="Để trống để dùng Prompt gốc của tool PC. Nhập prompt tại đây để thay thế hoàn toàn trong phiên hiện tại..." style="
+                            width: 100%;
+                            min-height: 75px;
+                            max-height: 150px;
+                            background: #18191f;
+                            color: #e6e6e6;
+                            border: 1px solid #3a3d4d;
+                            border-radius: 6px;
+                            padding: 6px 8px;
+                            font-size: 11px;
+                            font-family: inherit;
+                            resize: vertical;
+                            box-sizing: border-box;
+                            outline: none;
+                        "></textarea>
+                        <button id="kg-download-sample-prompt-btn" type="button" style="
+                            background: #252836;
+                            color: #4e8cff;
+                            border: 1px solid #4e8cff;
+                            border-radius: 6px;
+                            padding: 7px 10px;
+                            font-size: 11px;
+                            font-weight: 600;
+                            cursor: pointer;
+                            min-height: 32px;
+                            text-align: center;
+                        ">[ TẢI PROMPT MẪU (.TXT) ]</button>
                     </div>
                 </div>
 
@@ -1109,6 +1634,10 @@ ${missingLines}`;
         uiElements.batchSizeContainer = container.querySelector('#kg-batch-container');
         uiElements.batchSelect = container.querySelector('#kg-batch-select');
         uiElements.batchCustomInput = container.querySelector('#kg-batch-custom-input');
+        uiElements.promptToggleBtn = container.querySelector('#kg-prompt-toggle-btn');
+        uiElements.promptBody = container.querySelector('#kg-prompt-body');
+        uiElements.customPromptInput = container.querySelector('#kg-custom-prompt-input');
+        uiElements.downloadSamplePromptBtn = container.querySelector('#kg-download-sample-prompt-btn');
         uiElements.startBtn = container.querySelector('#kg-start-btn');
         uiElements.progressLabel = container.querySelector('#kg-progress-label');
         uiElements.progressBar = container.querySelector('#kg-progress-bar');
@@ -1117,8 +1646,22 @@ ${missingLines}`;
         uiElements.contentBody = container.querySelector('#kg-body');
         uiElements.countLabel = container.querySelector('#kg-count-label');
 
-        // Khôi phục cấu hình trên UI
+        // Khôi phục cấu hình Nhóm A trên UI
         syncConfigToUI();
+
+        // Thu gọn / mở rộng mục Prompt AI
+        let isPromptExpanded = false;
+        container.querySelector('#kg-prompt-header').addEventListener('click', () => {
+            isPromptExpanded = !isPromptExpanded;
+            uiElements.promptBody.style.display = isPromptExpanded ? 'flex' : 'none';
+            uiElements.promptToggleBtn.innerText = isPromptExpanded ? '−' : '+';
+        });
+
+        // Nút tải prompt mẫu
+        uiElements.downloadSamplePromptBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            downloadSamplePrompt();
+        });
 
         // Sự kiện đổi chế độ gửi
         uiElements.modeSelect.addEventListener('change', () => {
@@ -1227,13 +1770,13 @@ ${missingLines}`;
                 return;
             }
 
-            // Bắt đầu dịch
             startTranslationProcess();
         });
 
-        // Thu gọn / mở rộng giao diện
+        // Thu gọn / mở rộng giao diện khi nhấn nút thu gọn
         let isCollapsed = false;
-        uiElements.header.addEventListener('click', () => {
+        uiElements.collapseBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
             isCollapsed = !isCollapsed;
             if (isCollapsed) {
                 uiElements.contentBody.style.display = 'none';
@@ -1245,6 +1788,10 @@ ${missingLines}`;
                 container.style.width = 'calc(100vw - 20px)';
             }
         });
+
+        // Kích hoạt cơ chế kéo thả tự do và khôi phục vị trí đã lưu
+        PositionManager.attachDrag(uiElements.header, container);
+        PositionManager.applySaved(container);
 
         checkSavedSession();
     }
@@ -1333,11 +1880,11 @@ ${missingLines}`;
                             isTranslating: false,
                             stopRequested: false,
                             currentBatchIndex: saved.currentBatchIndex || 0,
-                            totalBatches: saved.totalBatches || Math.ceil(saved.items.length / (userSettings.batchSize || 100))
+                            totalBatches: saved.totalBatches || Math.ceil(saved.items.length / (userSettings.batchSize || 100)),
+                            lastCompletedItem: null
                         };
                         banner.style.display = 'none';
 
-                        // Hiển thị tên file và tổng phụ đề
                         if (uiElements.fileNameLabel) {
                             uiElements.fileNameLabel.innerHTML = `Tên file: <span style="color: #ffffff; font-weight: 600;">${saved.fileName}</span>`;
                         }
@@ -1364,7 +1911,7 @@ ${missingLines}`;
     }
 
     // =========================================================================
-    // 9. KHỞI CHẠY TỰ ĐỘNG
+    // 13. KHỞI CHẠY TỰ ĐỘNG
     // =========================================================================
     window.addEventListener('load', () => {
         setTimeout(injectUI, 1200);
